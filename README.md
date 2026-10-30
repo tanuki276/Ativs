@@ -1,5 +1,43 @@
 # Ativs
 
-Ativs is an Android app that turns app-usage records into achievements.
+アプリの使用記録を、実績に。Android 8.0以降で動作する、端末内完結のアプリです。
 
-This repository contains the Android MVP and a GitHub Actions workflow that builds a debug APK.
+## できること
+
+- 過去24時間の前面使用時間、アプリ別の記録、最終使用日時を表示
+- 各アプリの1・3・5・8・12時間使用／10回起動の実績を保存
+- 獲得済み実績は集計期間が過ぎても表示（アンインストールやデータ消去で削除）
+- 設定から戻ったときと「更新」ボタンで再集計
+- 通常・丸型のアダプティブアイコンとAndroid 13以降の単色テーマアイコン
+
+## 使い方
+
+1. インストール後、Ativsを開きます。
+2. 「使用状況へのアクセスを開く」からAtivsを許可します。
+3. Ativsへ戻ると記録を表示します。アクセスは端末の設定からいつでも取り消せます。
+
+ネットワーク通信や常駐サービスは使用しません。使用イベントは表示時に読み取り、保存するのは獲得済み実績とそのアプリ名です。Androidの自動バックアップは無効です。
+
+## 集計について
+
+日単位の`UsageStats`合計ではなく、前面／背面イベントを指定の24時間に切り詰めて集計します。開始時点ですでに開いていたアプリを復元するため、その前の24時間も読み取ります。ホーム画面、Ativs自身、ランチャーから起動できないシステムコンポーネントは一覧から除きます。
+
+起動回数はアプリを前面に開いた回数の**目安**です。同一アプリ内で1秒以内に切り替わった画面は追加起動に数えません。画面ロック・消灯・端末終了で使用時間を区切ります。複数ウィンドウでは直近に前面になったアプリを対象にし、重複計上を防ぎます。
+
+Androidやメーカーによる履歴の保持期間・イベントの欠落により、OSの「デジタルウェルビーイング」等と一致しない場合があります。開始イベントが履歴にない使用時間は推測しません。実績の判定はAtivsを開いた時点の過去24時間に対して行います。
+
+## 開発・検証
+
+必要環境: JDK 17、Android SDK Platform 35。Gradle 8.10.2は同梱のWrapperが取得します。Android Studioでプロジェクトを開くか、Android SDKを`ANDROID_HOME`または`local.properties`の`sdk.dir`で指定してください。
+
+```sh
+./gradlew :app:testDebugUnitTest :app:lintDebug :app:assembleDebug
+```
+
+APK: `app/build/outputs/apk/debug/app-debug.apk`
+
+GitHub Actionsはmainへのpush、Pull Request、手動実行に対応します。テスト・Lint・APK作成を実行し、APKと検証レポートをArtifactsに保存します。SDKセットアップでは廃止された`tools`をインストールせず、`platform-tools`を明示しています。
+
+使用集計の単体テストは時間境界、使用中アプリ、重複イベント、同一アプリ内の画面遷移、再起動・ロック、アプリ切替、履歴欠落を検証します。
+
+実機ではAndroid 8／Android 15以降での権限の許可・取消、長いアプリ名、大きな文字設定、ジェスチャー／3ボタン操作、ランチャーの丸型・単色アイコンも確認してください。
