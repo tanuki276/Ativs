@@ -4,9 +4,14 @@ import android.animation.ValueAnimator;
 import android.app.Activity;
 import android.app.AppOpsManager;
 import android.app.usage.UsageEvents;
-import android.app.usage.UsageStats;
 import android.app.usage.UsageStatsManager;
 import android.content.Context;
+import android.content.ActivityNotFoundException;
+import android.content.res.ColorStateList;
+import android.net.Uri;
+import android.os.Build;
+import android.view.WindowInsets;
+import android.widget.Toast;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.ApplicationInfo;
@@ -33,59 +38,163 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 public class MainActivity extends Activity {
     private LinearLayout content;
+    private final ExecutorService loader = Executors.newSingleThreadExecutor();
+    private Future<?> pendingLoad;
+    private int loadGeneration;
+    private static final int[] GOAL_HOURS = {1, 3, 5, 8, 12};
 
     // Quiet, matte colors. No glow / neon effects.
     private final int ink = Color.rgb(29, 31, 35);
     private final int muted = Color.rgb(100, 104, 111);
     private final int accent = Color.rgb(61, 72, 86);
-    private final int reward = Color.rgb(176, 137, 67);
+    private final int reward = Color.rgb(128, 99, 47);
     private final int surface = Color.rgb(250, 249, 247);
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        render();
+        getWindow().getDecorView().setSystemUiVisibility(
+                View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
+        getWindow().setStatusBarColor(surface);
+        getWindow().setNavigationBarColor(surface);
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        if (content != null) render();
+        render();
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        loadGeneration++;
+        if (pendingLoad != null) pendingLoad.cancel(true);
+    }
+
+    @Override
+    protected void onDestroy() {
+        loader.shutdownNow();
+        super.onDestroy();
     }
 
     private void render() {
+        final int generation = ++loadGeneration;
+        if (pendingLoad != null) pendingLoad.cancel(true);
         ScrollView scroll = new ScrollView(this);
         scroll.setBackgroundColor(surface);
         scroll.setClipToPadding(false);
-
+        scroll.setFillViewport(true);
+        scroll.setOnApplyWindowInsetsListener((view, insets) -> {
+            if (Build.VERSION.SDK_INT >= 30) {
+                android.graphics.Insets bars = insets.getInsets(
+                        WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
+                view.setPadding(bars.left, bars.top, bars.right, bars.bottom);
+            } else {
+                view.setPadding(insets.getSystemWindowInsetLeft(), insets.getSystemWindowInsetTop(),
+                        insets.getSystemWindowInsetRight(), insets.getSystemWindowInsetBottom());
+            }
+            return insets;
+        });
         content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
         content.setPadding(dp(20), dp(28), dp(20), dp(42));
         scroll.addView(content, new ScrollView.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT));
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         setContentView(scroll);
+        scroll.requestApplyInsets();
 
-        TextView title = text("Ativs", 32, ink, true);
-        content.addView(title);
-
+        LinearLayout brand = new LinearLayout(this);
+        brand.setGravity(Gravity.CENTER_VERTICAL);
+        ImageView logo = new ImageView(this);
+        logo.setImageResource(R.drawable.ic_brand);
+        logo.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        LinearLayout.LayoutParams logoParams = new LinearLayout.LayoutParams(dp(44), dp(44));
+        logoParams.setMargins(0, 0, dp(12), 0);
+        brand.addView(logo, logoParams);
+        brand.addView(text("Ativs", 32, ink, true));
+        content.addView(brand);
         TextView subtitle = text("アプリの使用記録を、実績に。", 15, muted, false);
-        subtitle.setPadding(0, dp(3), 0, dp(22));
+        subtitle.setPadding(0, dp(8), 0, dp(18));
         content.addView(subtitle);
 
         if (!hasUsageAccess()) {
             showPermissionCard();
             return;
         }
+        LinearLayout actions = new LinearLayout(this);
+        Button refresh = actionButton("更新", this::render);
+        Button settings = actionButton("アクセス設定", this::openUsageSettings);
+        actions.addView(refresh, new LinearLayout.LayoutParams(0, dp(48), 1f));
+        actions.addView(settings, new LinearLayout.LayoutParams(0, dp(48), 1f));
+        content.addView(actions);
+        TextView loading = text("使用記録を読み込んでいます…", 15, muted, false);
+        loading.setPadding(0, dp(24), 0, dp(24));
+        loading.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        content.addView(loading);
+        pendingLoad = loader.submit(() -> {
+            try {
+                long end = System.currentTimeMillis();
+                List<AppRecord> records = loadUsage(end);
+                runOnUiThread(() -> {
+                    if (generation != loadGeneration || isFinishing() || isDestroyed()) return;
+                    if (!hasUsageAccess()) {
+                        render();
+                        return;
+                    }
+                    content.removeView(loading);
+                    showUsage(records, end);
+                });
+            } catch (RuntimeException error) {
+                runOnUiThread(() -> {
+                    if (generation != loadGeneration || isFinishing() || isDestroyed()) return;
+                    content.removeView(loading);
+                    if (!hasUsageAccess()) {
+                        render();
+                        return;
+                    }
+                    LinearLayout failure = card();
+                    failure.addView(text("記録を読み込めませんでした", 18, ink, true));
+                    failure.addView(text("端末のロックを解除し、しばらくしてから更新してください。", 15, muted, false));
+                    failure.addView(actionButton("再試行", this::render));
+                    content.addView(failure);
+                });
+            }
+        });
+    }
 
-        showUsage();
+    private Button actionButton(String label, Runnable action) {
+        Button button = new Button(this);
+        button.setText(label);
+        button.setTextSize(14);
+        button.setAllCaps(false);
+        button.setMinHeight(dp(48));
+        button.setTextColor(accent);
+        button.setOnClickListener(view -> action.run());
+        return button;
+    }
+
+    private void openUsageSettings() {
+        Intent intent = new Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS,
+                Uri.parse("package:" + getPackageName()));
+        try {
+            startActivity(intent);
+        } catch (ActivityNotFoundException | SecurityException error) {
+            try {
+                startActivity(new Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS));
+            } catch (ActivityNotFoundException | SecurityException unavailable) {
+                Toast.makeText(this, "端末の設定から「使用状況へのアクセス」を開いてください。", Toast.LENGTH_LONG).show();
+            }
+        }
     }
 
     private void showPermissionCard() {
@@ -98,69 +207,87 @@ public class MainActivity extends Activity {
         body.setPadding(0, dp(10), 0, dp(16));
         card.addView(body);
 
-        Button button = new Button(this);
-        button.setText("使用状況へのアクセスを開く");
-        button.setTextSize(14);
-        button.setAllCaps(false);
-        button.setOnClickListener(v -> startActivity(new Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)));
-        card.addView(button);
+        card.addView(actionButton("使用状況へのアクセスを開く", this::openUsageSettings));
+        card.addView(text("記録は端末内で処理され、外部には送信されません。許可はいつでも設定から取り消せます。", 13, muted, false));
         content.addView(card);
         animateIn(card, 0);
     }
 
-    private void showUsage() {
+    private List<AppRecord> loadUsage(long end) {
         UsageStatsManager manager = (UsageStatsManager) getSystemService(Context.USAGE_STATS_SERVICE);
-        long end = System.currentTimeMillis();
-        long start = end - 24L * 60L * 60L * 1000L;
-
-        List<UsageStats> stats = manager.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, start, end);
-        Map<String, Integer> launches = queryLaunchCounts(manager, start, end);
-        Map<String, AppRecord> byPackage = new HashMap<>();
-        PackageManager pm = getPackageManager();
-
-        if (stats != null) {
-            for (UsageStats stat : stats) {
-                if (stat.getTotalTimeInForeground() <= 0) continue;
-
-                String packageName = stat.getPackageName();
-                AppRecord old = byPackage.get(packageName);
-                String label = packageName;
-                Drawable icon = null;
-
-                if (old != null) {
-                    label = old.label;
-                    icon = old.icon;
-                } else {
-                    try {
-                        ApplicationInfo info = pm.getApplicationInfo(packageName, 0);
-                        label = pm.getApplicationLabel(info).toString();
-                        icon = pm.getApplicationIcon(info);
-                    } catch (PackageManager.NameNotFoundException ignored) {
-                    }
-                }
-
-                long combinedTime = stat.getTotalTimeInForeground() + (old == null ? 0 : old.timeMs);
-                long lastUsed = Math.max(stat.getLastTimeUsed(), old == null ? 0 : old.lastUsed);
-                int launchCount = launches.getOrDefault(packageName, 0);
-                byPackage.put(packageName, new AppRecord(label, packageName, combinedTime, lastUsed, launchCount, icon));
+        if (manager == null) throw new IllegalStateException("Usage service unavailable");
+        long start = end - UsageAccumulator.DAY_MS;
+        // Read a warm-up day to recover sessions already running at the window boundary.
+        UsageEvents events = manager.queryEvents(start - UsageAccumulator.DAY_MS, end);
+        if (events == null) throw new IllegalStateException("Usage events unavailable");
+        UsageAccumulator accumulator = new UsageAccumulator(start, end);
+        UsageEvents.Event event = new UsageEvents.Event();
+        while (events.hasNextEvent()) {
+            if (Thread.currentThread().isInterrupted()) throw new IllegalStateException("Load cancelled");
+            events.getNextEvent(event);
+            switch (event.getEventType()) {
+                case UsageEvents.Event.MOVE_TO_FOREGROUND:
+                    accumulator.resume(event.getPackageName(), event.getTimeStamp());
+                    break;
+                case UsageEvents.Event.MOVE_TO_BACKGROUND:
+                    accumulator.pause(event.getPackageName(), event.getTimeStamp());
+                    break;
+                case UsageEvents.Event.SCREEN_NON_INTERACTIVE:
+                case UsageEvents.Event.KEYGUARD_SHOWN:
+                case UsageEvents.Event.DEVICE_SHUTDOWN:
+                case UsageEvents.Event.DEVICE_STARTUP:
+                    accumulator.interrupt(event.getTimeStamp());
+                    break;
+                default:
+                    break;
             }
         }
+        PackageManager pm = getPackageManager();
+        List<AppRecord> records = new ArrayList<>();
+        Intent homeIntent = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME);
+        android.content.pm.ResolveInfo home = pm.resolveActivity(homeIntent, PackageManager.MATCH_DEFAULT_ONLY);
+        String homePackage = home != null && home.activityInfo != null ? home.activityInfo.packageName : "";
+        for (Map.Entry<String, UsageAccumulator.Record> entry : accumulator.finish().entrySet()) {
+            String packageName = entry.getKey();
+            UsageAccumulator.Record usage = entry.getValue();
+            if (packageName.equals(getPackageName()) || packageName.equals(homePackage)
+                    || (usage.timeMs <= 0 && usage.launches == 0)
+                    || pm.getLaunchIntentForPackage(packageName) == null) continue;
+            try {
+                ApplicationInfo info = pm.getApplicationInfo(packageName, 0);
+                records.add(new AppRecord(pm.getApplicationLabel(info).toString(), packageName,
+                        usage.timeMs, usage.lastUsed, usage.launches, pm.getApplicationIcon(info)));
+            } catch (PackageManager.NameNotFoundException ignored) {
+                // An app can be uninstalled while the query is running.
+            }
+        }
+        records.sort(Comparator.comparingLong((AppRecord record) -> record.timeMs).reversed()
+                .thenComparing(record -> record.packageName));
+        return records;
+    }
 
-        List<AppRecord> records = new ArrayList<>(byPackage.values());
-        Collections.sort(records, Comparator.comparingLong((AppRecord r) -> r.timeMs).reversed());
-
+    private void showUsage(List<AppRecord> records, long end) {
         long total = 0;
         for (AppRecord r : records) total += r.timeMs;
 
         LinearLayout summary = card();
         summary.addView(text("過去24時間", 13, muted, true));
-        TextView totalView = text("0分", 36, ink, true);
+        TextView totalView = text(formatDuration(total), 36, ink, true);
         totalView.setPadding(0, dp(5), 0, dp(3));
         summary.addView(totalView);
         summary.addView(text(records.size() + "個のアプリを記録", 14, muted, false));
         content.addView(summary);
         animateIn(summary, 0);
-        animateDuration(totalView, total);
+        SimpleDateFormat windowFormat = new SimpleDateFormat("M/d HH:mm", Locale.getDefault());
+        TextView window = text(windowFormat.format(new Date(end - UsageAccumulator.DAY_MS))
+                + " 〜 " + windowFormat.format(new Date(end)), 12, muted, false);
+        window.setPadding(0, dp(8), 0, 0);
+        summary.addView(window);
+        TextView note = text("ホーム画面とAtivsを除くアプリの前面使用を集計。起動回数はアプリを前面に開いた回数の目安です。", 12, muted, false);
+        note.setPadding(0, dp(8), 0, 0);
+        summary.addView(note);
+
+        showAchievements(records);
 
         if (records.isEmpty()) {
             TextView empty = text("まだ使用記録がありません。アプリを使ったあとに戻ってきてください。", 15, muted, false);
@@ -171,33 +298,7 @@ public class MainActivity extends Activity {
 
         AppRecord top = records.get(0);
 
-        TextView achievementHeading = sectionTitle("アチーブメント");
-        content.addView(achievementHeading);
-
-        addAchievement(
-                "1",
-                "今日のトップ",
-                top.label + "  ·  " + formatDuration(top.timeMs),
-                false,
-                false);
-
-        boolean hasMilestone = false;
-        if (top.timeMs >= 60L * 60L * 1000L) {
-            boolean fresh = unlockOnce("usage_1h_" + top.packageName);
-            addAchievement("1h", "1時間達成", top.label + "を24時間内に1時間以上使用", true, fresh);
-            hasMilestone = true;
-        }
-        if (top.launches >= 10) {
-            boolean fresh = unlockOnce("launch_10_" + top.packageName);
-            addAchievement("10×", "10回起動", top.label + "を24時間内に10回以上起動", true, fresh);
-            hasMilestone = true;
-        }
-
-        if (!hasMilestone) {
-            TextView hint = text("もう少しで最初の実績です。", 13, muted, false);
-            hint.setPadding(dp(4), 0, 0, dp(4));
-            content.addView(hint);
-        }
+        addAchievement("1", "過去24時間のトップ", top.label + "  ·  " + formatDuration(top.timeMs), false, false);
 
         addNextGoal(top);
 
@@ -205,28 +306,97 @@ public class MainActivity extends Activity {
         recordHeading.setPadding(0, dp(26), 0, dp(10));
         content.addView(recordHeading);
 
-        SimpleDateFormat timeFormat = new SimpleDateFormat("HH:mm", Locale.getDefault());
-        int limit = Math.min(records.size(), 30);
+        int limit = records.size();
         for (int i = 0; i < limit; i++) {
-            addAppRow(records.get(i), timeFormat, i);
+            addAppRow(records.get(i), i);
+        }
+    }
+
+    private void showAchievements(List<AppRecord> records) {
+        content.addView(sectionTitle("アチーブメント"));
+        SharedPreferences prefs = getSharedPreferences("achievements", MODE_PRIVATE);
+        SharedPreferences.Editor editor = prefs.edit();
+        java.util.Set<String> fresh = new java.util.HashSet<>();
+        for (AppRecord record : records) {
+            editor.putString("label_" + record.packageName, record.label);
+            for (int hours : GOAL_HOURS) {
+                String key = "usage_" + hours + "h_" + record.packageName;
+                if (record.timeMs >= hours * 3600000L && !prefs.getBoolean(key, false)) {
+                    editor.putBoolean(key, true);
+                    fresh.add(key);
+                }
+            }
+            String key = "launch_10_" + record.packageName;
+            if (record.launches >= 10 && !prefs.getBoolean(key, false)) {
+                editor.putBoolean(key, true);
+                fresh.add(key);
+            }
+        }
+        editor.apply();
+        List<String> keys = new ArrayList<>();
+        for (Map.Entry<String, ?> entry : prefs.getAll().entrySet()) {
+            if (Boolean.TRUE.equals(entry.getValue())
+                    && (entry.getKey().startsWith("usage_") || entry.getKey().startsWith("launch_10_"))) {
+                keys.add(entry.getKey());
+            }
+        }
+        Collections.sort(keys, (left, right) -> {
+            int freshOrder = Boolean.compare(fresh.contains(right), fresh.contains(left));
+            return freshOrder != 0 ? freshOrder : left.compareTo(right);
+        });
+        if (keys.isEmpty()) {
+            LinearLayout empty = card();
+            empty.addView(text("実績はここに残ります", 17, ink, true));
+            empty.addView(text("過去24時間で1つのアプリを1時間使用、または10回開くと獲得できます。自分のペースで記録しましょう。", 14, muted, false));
+            content.addView(empty);
+        }
+        LinearLayout achievementList = new LinearLayout(this);
+        achievementList.setOrientation(LinearLayout.VERTICAL);
+        content.addView(achievementList);
+        addAchievementPage(achievementList, keys, fresh, prefs, 0);
+    }
+
+    private void addAchievementPage(LinearLayout list, List<String> keys, java.util.Set<String> fresh,
+            SharedPreferences prefs, int offset) {
+        int end = Math.min(keys.size(), offset + 8);
+        for (int index = offset; index < end; index++) {
+            String key = keys.get(index);
+            int separator = key.indexOf('_', key.indexOf('_') + 1);
+            if (separator < 0 || separator == key.length() - 1) continue;
+            String packageName = key.substring(separator + 1);
+            String label = prefs.getString("label_" + packageName, packageName);
+            boolean launch = key.startsWith("launch_");
+            String milestone = key.substring(key.indexOf('_') + 1, separator);
+            addAchievement(list, launch ? "10×" : milestone,
+                    launch ? "10回起動" : milestone.replace("h", "時間") + "達成",
+                    label + " · 獲得済み", true, fresh.contains(key));
+        }
+        if (end < keys.size()) {
+            Button more = actionButton("実績をもっと見る（残り" + (keys.size() - end) + "件）", () -> {});
+            more.setOnClickListener(view -> {
+                list.removeView(more);
+                addAchievementPage(list, keys, fresh, prefs, end);
+            });
+            list.addView(more);
         }
     }
 
     private void addNextGoal(AppRecord top) {
-        long[] goals = {
-                60L * 60L * 1000L,
-                3L * 60L * 60L * 1000L,
-                5L * 60L * 60L * 1000L,
-                8L * 60L * 60L * 1000L,
-                12L * 60L * 60L * 1000L
-        };
-
-        long target = goals[goals.length - 1];
-        for (long goal : goals) {
-            if (top.timeMs < goal) {
+        long target = 0;
+        for (int hours : GOAL_HOURS) {
+            long goal = hours * 3600000L;
+            if (!getSharedPreferences("achievements", MODE_PRIVATE)
+                    .getBoolean("usage_" + hours + "h_" + top.packageName, false)) {
                 target = goal;
                 break;
             }
+        }
+        if (target == 0) {
+            LinearLayout completed = card();
+            completed.addView(text("時間の実績をすべて達成", 17, ink, true));
+            completed.addView(text(top.label + " · 12時間までの実績を獲得しました。", 14, muted, false));
+            content.addView(completed);
+            return;
         }
 
         int progressValue = (int) Math.min(1000L, (top.timeMs * 1000L) / Math.max(1L, target));
@@ -243,7 +413,9 @@ public class MainActivity extends Activity {
 
         ProgressBar progress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         progress.setMax(1000);
-        progress.setProgress(0);
+        progress.setProgress(progressValue);
+        progress.setProgressTintList(ColorStateList.valueOf(reward));
+        progress.setProgressBackgroundTintList(ColorStateList.valueOf(Color.rgb(238, 236, 231)));
         progress.setMinimumHeight(dp(6));
         goal.addView(progress, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -255,14 +427,9 @@ public class MainActivity extends Activity {
         content.addView(goal);
         animateIn(goal, 2);
 
-        ValueAnimator animator = ValueAnimator.ofInt(0, progressValue);
-        animator.setDuration(650);
-        animator.setInterpolator(new DecelerateInterpolator());
-        animator.addUpdateListener(a -> progress.setProgress((int) a.getAnimatedValue()));
-        animator.start();
     }
 
-    private void addAppRow(AppRecord r, SimpleDateFormat timeFormat, int index) {
+    private void addAppRow(AppRecord r, int index) {
         LinearLayout row = card();
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
@@ -271,6 +438,7 @@ public class MainActivity extends Activity {
         if (r.icon != null) {
             ImageView icon = new ImageView(this);
             icon.setImageDrawable(r.icon);
+            icon.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
             LinearLayout.LayoutParams iconParams = new LinearLayout.LayoutParams(dp(42), dp(42));
             iconParams.setMargins(0, 0, dp(13), 0);
             row.addView(icon, iconParams);
@@ -280,44 +448,31 @@ public class MainActivity extends Activity {
         info.setOrientation(LinearLayout.VERTICAL);
         info.addView(text(r.label, 16, ink, true));
         info.addView(text(formatDuration(r.timeMs) + "  ·  起動 " + r.launches + "回", 13, accent, true));
-        info.addView(text("最終使用 " + timeFormat.format(new Date(r.lastUsed)), 12, muted, false));
+        info.addView(text("最終使用 " + new SimpleDateFormat("M/d HH:mm", Locale.getDefault()).format(new Date(r.lastUsed)), 12, muted, false));
         row.addView(info, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
         content.addView(row);
         animateIn(row, Math.min(index + 3, 10));
     }
 
-    private Map<String, Integer> queryLaunchCounts(UsageStatsManager manager, long start, long end) {
-        Map<String, Integer> counts = new HashMap<>();
-        UsageEvents events = manager.queryEvents(start, end);
-        UsageEvents.Event event = new UsageEvents.Event();
-        while (events != null && events.hasNextEvent()) {
-            events.getNextEvent(event);
-            if (event.getEventType() == UsageEvents.Event.ACTIVITY_RESUMED) {
-                String pkg = event.getPackageName();
-                counts.put(pkg, counts.getOrDefault(pkg, 0) + 1);
-            }
-        }
-        return counts;
-    }
-
     private boolean hasUsageAccess() {
         AppOpsManager appOps = (AppOpsManager) getSystemService(Context.APP_OPS_SERVICE);
-        int mode = appOps.checkOpNoThrow(
-                AppOpsManager.OPSTR_GET_USAGE_STATS,
-                Process.myUid(),
-                getPackageName());
-        return mode == AppOpsManager.MODE_ALLOWED;
-    }
-
-    private boolean unlockOnce(String key) {
-        SharedPreferences prefs = getSharedPreferences("achievements", MODE_PRIVATE);
-        if (prefs.getBoolean(key, false)) return false;
-        prefs.edit().putBoolean(key, true).apply();
-        return true;
+        if (appOps == null) return false;
+        try {
+            int mode = appOps.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS,
+                    Process.myUid(), getPackageName());
+            return mode == AppOpsManager.MODE_ALLOWED;
+        } catch (SecurityException error) {
+            return false;
+        }
     }
 
     private void addAchievement(String mark, String title, String description, boolean unlocked, boolean fresh) {
+        addAchievement(content, mark, title, description, unlocked, fresh);
+    }
+
+    private void addAchievement(LinearLayout parent, String mark, String title, String description,
+            boolean unlocked, boolean fresh) {
         LinearLayout card = card();
         card.setOrientation(LinearLayout.HORIZONTAL);
         card.setGravity(Gravity.CENTER_VERTICAL);
@@ -339,7 +494,8 @@ public class MainActivity extends Activity {
         LinearLayout topLine = new LinearLayout(this);
         topLine.setOrientation(LinearLayout.HORIZONTAL);
         topLine.setGravity(Gravity.CENTER_VERTICAL);
-        topLine.addView(text(title, 16, ink, true));
+        topLine.addView(text(title, 16, ink, true),
+                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
         if (fresh) {
             TextView newTag = text("NEW", 10, reward, true);
@@ -361,9 +517,9 @@ public class MainActivity extends Activity {
         copy.addView(desc);
         card.addView(copy, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
-        content.addView(card);
+        parent.addView(card);
 
-        if (fresh) {
+        if (fresh && ValueAnimator.areAnimatorsEnabled()) {
             card.setAlpha(0f);
             card.setScaleX(0.97f);
             card.setScaleY(0.97f);
@@ -373,7 +529,8 @@ public class MainActivity extends Activity {
                     .scaleY(1f)
                     .setDuration(260)
                     .setInterpolator(new DecelerateInterpolator())
-                    .withStartAction(() -> card.performHapticFeedback(HapticFeedbackConstants.CONFIRM))
+                    .withStartAction(() -> card.performHapticFeedback(Build.VERSION.SDK_INT >= 30
+                            ? HapticFeedbackConstants.CONFIRM : HapticFeedbackConstants.VIRTUAL_KEY))
                     .start();
         } else {
             animateIn(card, 1);
@@ -386,18 +543,8 @@ public class MainActivity extends Activity {
         return heading;
     }
 
-    private void animateDuration(TextView view, long targetMs) {
-        ValueAnimator animator = ValueAnimator.ofFloat(0f, 1f);
-        animator.setDuration(700);
-        animator.setInterpolator(new DecelerateInterpolator());
-        animator.addUpdateListener(a -> {
-            float fraction = (float) a.getAnimatedValue();
-            view.setText(formatDuration((long) (targetMs * fraction)));
-        });
-        animator.start();
-    }
-
     private void animateIn(View view, int order) {
+        if (!ValueAnimator.areAnimatorsEnabled()) return;
         view.setAlpha(0f);
         view.setTranslationY(dp(8));
         view.animate()
@@ -435,12 +582,14 @@ public class MainActivity extends Activity {
         view.setTextColor(color);
         view.setGravity(Gravity.START);
         view.setIncludeFontPadding(false);
+        view.setTextLocale(Locale.JAPANESE);
         if (bold) view.setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD);
         return view;
     }
 
     private String formatDuration(long ms) {
-        long minutes = ms / 60000L;
+        if (ms > 0 && ms < 60000L) return "1分未満";
+        long minutes = Math.max(0L, ms) / 60000L;
         long hours = minutes / 60L;
         long remaining = minutes % 60L;
         if (hours > 0) return hours + "時間 " + remaining + "分";
